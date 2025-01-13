@@ -1,20 +1,12 @@
 import hashlib
-import argparse
 import concurrent.futures
 import time
 import pathlib
 import requests
 import re
 import magic
-import logging
 from typing import List, Dict, Optional, Union
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from io import BytesIO
 
 # Configuration constants
 CONFIG = {
@@ -23,9 +15,10 @@ CONFIG = {
     'RATE_LIMIT_WAIT': 60,
     'ANALYSIS_POLL_INTERVAL': 20,
     'MAX_FILE_SIZE_MB': 32,
+    'CHUNK_SIZE': 8192  # Optimal chunk size for file reading
 }
 
-# Suspicious file extensions and patterns
+# Enhanced suspicious indicators
 SUSPICIOUS_INDICATORS = {
     'EXTENSIONS': {
         # Executable and script files
@@ -34,322 +27,370 @@ SUSPICIOUS_INDICATORS = {
         '.psd1', '.msi', '.msp', '.mst', '.jar', '.deb', '.rpm',
         # Additional suspicious extensions
         '.dll', '.sys', '.drv', '.bin', '.pyc', '.pyo',
-        '.sh', '.bash', '.ksh', '.csh', '.pl', '.php'
+        '.sh', '.bash', '.ksh', '.csh', '.pl', '.php',
+        # Archive extensions that might contain malware
+        '.zip', '.rar', '.7z', '.tar', '.gz', '.iso',
+        # Office documents that might contain macros
+        '.doc', '.docm', '.xls', '.xlsm', '.ppt', '.pptm'
     },
     'PATTERNS': [
-        # Command execution
+        # Enhanced command execution patterns
         r'cmd\.exe', r'powershell\.exe', r'bash\.exe', r'sh\.exe',
-        # Code execution
+        r'rundll32\.exe', r'regsvr32\.exe', r'mshta\.exe',
+        # Enhanced code execution patterns
         r'base64_decode', r'system\(\)', r'eval\(', r'exec\(',
-        r'\bshell_exec\b', r'CreateObject\(',
-        # Network activity
-        r'urllib\.(request|parse)', r'requests\.',
-        r'socket\.(connect|bind|listen)',
-        # File operations
-        r'os\.(system|popen|exec)', r'subprocess\.(Popen|call|run)',
-        r'chmod.*\+x', r'icacls.*\/grant',
-        # Encoding/Encryption
+        r'\bshell_exec\b', r'CreateObject\(', r'WScript.Shell',
+        r'ActiveXObject', r'Process.Start', r'Runtime.getRuntime\(',
+        # Network activity patterns
+        r'urllib\.(request|parse)', r'requests\.', r'wget\.',
+        r'socket\.(connect|bind|listen)', r'http[s]?://',
+        r'ftp://', r'ssh://', r'telnet://',
+        # Enhanced file operations
+        r'os\.(system|popen|exec)', r'subprocess\.',
+        r'chmod.*\+x', r'icacls.*\/grant', r'cacls', r'attrib',
+        # Registry and system modifications
+        r'RegCreateKey', r'RegSetValue', r'Registry\.',
+        r'HKEY_LOCAL_MACHINE', r'HKEY_CURRENT_USER',
+        # Encryption and encoding patterns
         r'base64\.(encode|decode)', r'crypto', r'cipher',
-        # Registry operations
-        r'RegCreateKey', r'RegSetValue', r'Registry\.'
+        r'password', r'encrypt', r'decrypt'
     ]
 }
 
 
 class FileScanner:
     def __init__(self, api_key: str = CONFIG['API_KEY']):
-        """
-        Initialize FileScanner with VirusTotal API key.
-
-        :param api_key: VirusTotal API key
-        """
         self.api_key = api_key
         self.headers = {"x-apikey": self.api_key}
+        self.mime = magic.Magic(mime=True)
+        self.raw = magic.Magic()
 
-    def _get_mime_type(self, file_path: pathlib.Path) -> Optional[str]:
+    def _read_file_safely(self, file_path: pathlib.Path) -> Optional[bytes]:
         """
-        Detect MIME type of a file.
+        Safely read file content with multiple encoding attempts.
 
         :param file_path: Path to the file
-        :return: MIME type or None if detection fails
+        :return: File content as bytes or None if reading fails
         """
         try:
-            mime = magic.Magic(mime=True)
-            return mime.from_file(str(file_path))
-        except Exception as e:
-            logger.warning(f"MIME type detection failed for {file_path}: {e}")
+            with open(file_path, 'rb') as f:
+                return f.read()
+        except Exception:
             return None
+
+    def _get_file_info(self, file_path: pathlib.Path) -> Dict[str, str]:
+        """
+        Get comprehensive file information.
+
+        :param file_path: Path to the file
+        :return: Dictionary containing file information
+        """
+        content = self._read_file_safely(file_path)
+        if not content:
+            return {'mime_type': 'unknown', 'file_type': 'unknown'}
+
+        return {
+            'mime_type': self.mime.from_buffer(content),
+            'file_type': self.raw.from_buffer(content)
+        }
+
+    def _deep_content_analysis(self, content: bytes, file_info: Dict[str, str]) -> List[str]:
+        """
+        Perform deep content analysis of file bytes.
+
+        :param content: File content as bytes
+        :param file_info: File information dictionary
+        :return: List of suspicious indicators found
+        """
+        indicators = []
+
+        # Check for executable headers
+        if content.startswith(b'MZ'):
+            indicators.append('DOS/Windows executable header')
+        elif content.startswith(b'\x7fELF'):
+            indicators.append('ELF executable header')
+        elif content.startswith(b'#!'):
+            indicators.append('Shell script header')
+
+        # Check for Office document markers
+        if b'Microsoft Office Word' in content or b'Microsoft Office Excel' in content:
+            indicators.append('Microsoft Office document')
+            # Check for macro indicators
+            if b'VBA' in content or b'macro' in content.lower():
+                indicators.append('Contains macros')
+
+        # Check for script content
+        try:
+            text_content = content.decode('utf-8', errors='ignore')
+
+            # Check for suspicious patterns
+            for pattern in SUSPICIOUS_INDICATORS['PATTERNS']:
+                if re.search(pattern, text_content, re.IGNORECASE):
+                    indicators.append(f'Suspicious pattern: {pattern}')
+
+            # Additional script checks
+            script_indicators = [
+                ('import os', 'OS module usage'),
+                ('import sys', 'System module usage'),
+                ('subprocess', 'Subprocess usage'),
+                ('shell=True', 'Shell execution'),
+                ('eval(', 'Evaluation of strings'),
+                ('exec(', 'Code execution'),
+                ('chmod +x', 'Permission modification')
+            ]
+
+            for indicator, description in script_indicators:
+                if indicator in text_content:
+                    indicators.append(description)
+
+        except UnicodeDecodeError:
+            # Binary file analysis
+            if b'PK\x03\x04' in content[:4]:  # ZIP signature
+                indicators.append('ZIP archive')
+            elif b'Rar!' in content[:4]:  # RAR signature
+                indicators.append('RAR archive')
+
+        return indicators
 
     def _check_suspicious_indicators(self, file_path: pathlib.Path) -> Dict[str, List[str]]:
         """
-        Perform static content analysis for suspicious indicators, supporting both binary and text files.
+        Enhanced suspicious indicator checking.
 
         :param file_path: Path to the file
         :return: Dictionary of detected suspicious indicators
         """
-        detected_indicators = {
+        detected = {
             'extensions': [],
             'patterns': [],
-            'characteristics': []  # New category for binary-specific indicators
+            'characteristics': []
         }
 
-        # Check file extension
+        # Check extension
         if file_path.suffix.lower() in SUSPICIOUS_INDICATORS['EXTENSIONS']:
-            detected_indicators['extensions'].append(file_path.suffix.lower())
+            detected['extensions'].append(file_path.suffix.lower())
 
-        try:
-            # First, try to read file as binary
-            with open(file_path, 'rb') as f:
-                content = f.read()
+        # Read and analyze file content
+        content = self._read_file_safely(file_path)
+        if content:
+            file_info = self._get_file_info(file_path)
+            detected['characteristics'].extend(
+                self._deep_content_analysis(content, file_info)
+            )
 
-                # Check for binary file characteristics
-                # Look for executable headers
-                if content.startswith(b'MZ'):  # DOS/PE executable
-                    detected_indicators['characteristics'].append('DOS/Windows executable header')
-                elif content.startswith(b'\x7fELF'):  # ELF executable
-                    detected_indicators['characteristics'].append('ELF executable header')
-                elif content.startswith(b'#!'):  # Shell script
-                    detected_indicators['characteristics'].append('Shell script header')
+        return detected
 
-                # Check for encoded/compressed content indicators
-                if b'base64' in content:
-                    detected_indicators['characteristics'].append('Contains base64 encoding')
-
-                # Try to decode as text for pattern matching
-                try:
-                    text_content = content.decode('utf-8', errors='ignore')
-
-                    # Check for suspicious patterns in text content
-                    for pattern in SUSPICIOUS_INDICATORS['PATTERNS']:
-                        matches = re.findall(pattern, text_content, re.IGNORECASE)
-                        if matches:
-                            detected_indicators['patterns'].extend(matches)
-
-                    # Additional checks for script-like content
-                    if any(keyword in text_content.lower() for keyword in [
-                        'import os', 'import sys', 'subprocess', 'shell=True',
-                        'eval(', 'exec(', 'os.system', 'chmod +x'
-                    ]):
-                        detected_indicators['patterns'].append('Suspicious script commands')
-
-                except UnicodeDecodeError:
-                    # File is purely binary, which is fine - we've already checked binary characteristics
-                    pass
-
-        except Exception as e:
-            logger.error(f"Content analysis failed for {file_path}: {e}")
-            detected_indicators['characteristics'].append(f'Analysis error: {str(e)}')
-
-        return detected_indicators
-
-    def _hash_file(self, file_path: pathlib.Path, algorithm: str = 'sha256') -> Optional[str]:
+    def _hash_file(self, file_path: pathlib.Path) -> Dict[str, str]:
         """
-        Calculate file hash using specified algorithm.
+        Calculate multiple hash types for a file.
 
         :param file_path: Path to the file
-        :param algorithm: Hashing algorithm (sha256, sha1, or md5)
-        :return: File hash or None if hashing fails
+        :return: Dictionary of hash values
         """
-        hash_algorithms = {
-            'sha256': hashlib.sha256(),
+        hashes = {
+            'md5': hashlib.md5(),
             'sha1': hashlib.sha1(),
-            'md5': hashlib.md5()
+            'sha256': hashlib.sha256()
         }
-
-        hasher = hash_algorithms.get(algorithm)
-        if not hasher:
-            raise ValueError(f"Unsupported hash algorithm: {algorithm}")
 
         try:
             with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hasher.update(chunk)
-            return hasher.hexdigest()
-        except PermissionError:
-            logger.warning(f"Permission denied for file: {file_path}")
-            return None
-        except Exception as e:
-            logger.error(f"Hashing failed for {file_path}: {e}")
-            return None
+                while chunk := f.read(CONFIG['CHUNK_SIZE']):
+                    for hasher in hashes.values():
+                        hasher.update(chunk)
 
-    def _virustotal_request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
-        """
-        Handle VirusTotal API requests with error handling.
-
-        :param method: HTTP method (get or post)
-        :param url: API endpoint URL
-        :param kwargs: Additional request parameters
-        :return: Response object or None
-        """
-        try:
-            request_method = getattr(requests, method)
-            response = request_method(url, headers=self.headers, **kwargs)
-
-            # Handle rate limiting
-            while response.status_code == 429:
-                logger.info("Rate limited. Waiting before retrying...")
-                time.sleep(CONFIG['RATE_LIMIT_WAIT'])
-                response = request_method(url, headers=self.headers, **kwargs)
-
-            response.raise_for_status()
-            return response
-        except requests.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            return None
+            return {
+                name: hasher.hexdigest()
+                for name, hasher in hashes.items()
+            }
+        except Exception:
+            return {name: None for name in hashes.keys()}
 
     def scan_file(self, file_path: pathlib.Path) -> Dict[str, Union[str, List[str], None]]:
         """
-        Comprehensively scan a single file.
+        Enhanced file scanning with comprehensive analysis.
 
         :param file_path: Path to the file
         :return: Scan results dictionary
         """
-        # Initialize scan results
-        scan_result = {
+        if not file_path.exists():
+            return {
+                'file_path': str(file_path),
+                'status': 'error',
+                'error': 'File not found'
+            }
+
+        result = {
             'file_path': str(file_path),
-            'mime_type': None,
-            'suspicious_indicators': None,
+            'file_info': self._get_file_info(file_path),
+            'hashes': self._hash_file(file_path),
+            'suspicious_indicators': self._check_suspicious_indicators(file_path),
             'virustotal_status': None,
-            'overall_risk': 'low'
+            'risk_level': 'low'
         }
 
-        if not file_path.exists():
-            scan_result['overall_risk'] = 'unknown'
-            scan_result['virustotal_status'] = "File not found"
-            return scan_result
+        # Assess risk level
+        if result['suspicious_indicators']['extensions'] or \
+                result['suspicious_indicators']['characteristics']:
+            result['risk_level'] = 'high'
+        elif result['suspicious_indicators']['patterns']:
+            result['risk_level'] = 'medium'
 
-        # MIME Type and Suspicious Indicators Check
-        scan_result['mime_type'] = self._get_mime_type(file_path)
-        suspicious_indicators = self._check_suspicious_indicators(file_path)
+        # VirusTotal scan
+        if result['hashes']['sha256']:
+            vt_result = self._virustotal_scan(file_path, result['hashes']['sha256'])
+            result['virustotal_status'] = vt_result
+            if vt_result and vt_result.get('detected', False):
+                result['risk_level'] = 'high'
 
-        if suspicious_indicators['extensions'] or suspicious_indicators['patterns']:
-            scan_result['suspicious_indicators'] = suspicious_indicators
-            scan_result['overall_risk'] = 'high' if suspicious_indicators['patterns'] else 'medium'
+        return result
 
-        # Hash and VirusTotal Scan
-        f_hash = self._hash_file(file_path)
-        if not f_hash:
-            scan_result['virustotal_status'] = 'Unable to hash'
-            return scan_result
+    def _virustotal_scan(self, file_path: pathlib.Path, file_hash: str) -> Optional[Dict]:
+        """
+        Enhanced VirusTotal scanning with better error handling and rate limiting.
 
-        # Perform VirusTotal analysis
-        vt_url = f"{CONFIG['VIRUSTOTAL_API_URL']}/{f_hash}"
-        response = self._virustotal_request('get', vt_url)
+        :param file_path: Path to the file
+        :param file_hash: SHA256 hash of the file
+        :return: Scan results dictionary or None
+        """
+        try:
+            # Check if file has been previously analyzed
+            response = requests.get(
+                f"{CONFIG['VIRUSTOTAL_API_URL']}/{file_hash}",
+                headers=self.headers
+            )
 
-        if not response or response.status_code == 404:
-            # Upload file for analysis if not found
-            file_size = file_path.stat().st_size
-            upload_url = CONFIG['VIRUSTOTAL_API_URL'] + (
-                '/upload_url' if file_size > CONFIG['MAX_FILE_SIZE_MB'] * 1000000 else '')
+            if response.status_code == 200:
+                return self._parse_vt_response(response.json())
 
-            with open(file_path, "rb") as f:
-                files = {"file": (file_path.name, f)}
-                upload_response = self._virustotal_request('post', upload_url, files=files)
+            elif response.status_code == 404:
+                # File hasn't been analyzed before, upload it
+                upload_url = CONFIG['VIRUSTOTAL_API_URL']
+                if file_path.stat().st_size > CONFIG['MAX_FILE_SIZE_MB'] * 1024 * 1024:
+                    upload_url += '/upload_url'
 
-            if upload_response:
-                # Wait for analysis and get results
-                analysis_id = upload_response.json().get("data", {}).get("id")
-                analysis_url = f"{CONFIG['VIRUSTOTAL_API_URL']}/analyses/{analysis_id}"
+                with open(file_path, 'rb') as f:
+                    files = {'file': (file_path.name, f)}
+                    upload_response = requests.post(
+                        upload_url,
+                        headers=self.headers,
+                        files=files
+                    )
 
-                while True:
-                    time.sleep(CONFIG['ANALYSIS_POLL_INTERVAL'])
-                    analysis_response = self._virustotal_request('get', analysis_url)
+                if upload_response.status_code == 200:
+                    analysis_id = upload_response.json()['data']['id']
+                    return self._poll_analysis(analysis_id)
 
-                    if not analysis_response:
-                        break
+            elif response.status_code == 429:
+                # Rate limited
+                time.sleep(CONFIG['RATE_LIMIT_WAIT'])
+                return self._virustotal_scan(file_path, file_hash)
 
-                    status = analysis_response.json().get("data", {}).get("attributes", {}).get("status")
-                    if status == "completed":
-                        f_hash = analysis_response.json().get("meta", {}).get("file_info", {}).get("sha256")
-                        break
+        except Exception:
+            return None
 
-        # Check VirusTotal results
-        if response and response.status_code == 200:
-            parsed_response = response.json().get("data", {}).get("attributes", {})
-            engine_detected = parsed_response.get("last_analysis_stats", {}).get("malicious", 0) > 0
+    def _poll_analysis(self, analysis_id: str) -> Optional[Dict]:
+        """
+        Poll VirusTotal for analysis results.
 
-            scan_result['virustotal_status'] = 'bad' if engine_detected else 'good'
-            if engine_detected:
-                scan_result['overall_risk'] = 'high'
+        :param analysis_id: Analysis ID from VirusTotal
+        :return: Analysis results dictionary or None
+        """
+        max_attempts = 10
+        for _ in range(max_attempts):
+            try:
+                response = requests.get(
+                    f"{CONFIG['VIRUSTOTAL_API_URL']}/analyses/{analysis_id}",
+                    headers=self.headers
+                )
 
-        return scan_result
+                if response.status_code == 200:
+                    data = response.json()['data']
+                    if data['attributes']['status'] == 'completed':
+                        return self._parse_vt_response(data)
+
+                time.sleep(CONFIG['ANALYSIS_POLL_INTERVAL'])
+
+            except Exception:
+                return None
+
+        return None
+
+    @staticmethod
+    def _parse_vt_response(response_data: Dict) -> Dict:
+        """
+        Parse VirusTotal response data.
+
+        :param response_data: Response data from VirusTotal
+        :return: Parsed results dictionary
+        """
+        stats = response_data.get('attributes', {}).get('last_analysis_stats', {})
+        return {
+            'detected': stats.get('malicious', 0) > 0,
+            'total_scans': sum(stats.values()),
+            'malicious': stats.get('malicious', 0),
+            'suspicious': stats.get('suspicious', 0),
+            'undetected': stats.get('undetected', 0)
+        }
 
 
 def get_files(path: Union[str, pathlib.Path]) -> List[pathlib.Path]:
     """
-    Returns a list of files from the directory (path can be a folder or single file).
+    Get list of files to scan.
 
     :param path: Path to file or directory
     :return: List of file paths
     """
     path = pathlib.Path(path)
     if path.is_dir():
-        # Skip system and hidden files
-        return [file for file in path.iterdir() if file.is_file() and not file.name.startswith('.')]
+        return [f for f in path.rglob('*') if f.is_file() and not f.name.startswith('.')]
     elif path.is_file():
         return [path]
     else:
-        raise ValueError(f"{path} is not a valid file or directory")
-
-
-def scan_file(file_path: pathlib.Path) -> Dict[str, Union[str, List[str], None]]:
-    """
-    Wrapper function to use FileScanner class for compatibility with map() and multiprocessing.
-
-    :param file_path: Path to the file
-    :return: Scan results dictionary
-    """
-    scanner = FileScanner()
-    return scanner.scan_file(file_path)
+        raise ValueError(f"Invalid path: {path}")
 
 
 def main():
-    """
-    Main function to scan files or directories.
-    """
-    # Ask user for file or folder path
-    path = input("Enter a file path or folder path to scan: ")
-
-    # Get list of files
+    """Main function to run the file scanner."""
     try:
-        files_list = get_files(path)
-    except ValueError as e:
-        print(e)
-        return
+        path = input("Enter a file path or folder path to scan: ").strip()
+        files = get_files(path)
 
-    if not files_list:
-        print("No files found to scan.")
-        return
+        if not files:
+            print("No files found to scan.")
+            return
 
-    print(f"Found {len(files_list)} files to scan.")
+        print(f"Found {len(files)} files to scan.")
+        scanner = FileScanner()
 
-    # Thread pool executor to scan files concurrently
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        results = list(executor.map(scan_file, files_list))
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_file = {
+                executor.submit(scanner.scan_file, file_path): file_path
+                for file_path in files
+            }
 
-    # Print the final results
-    print("\nComprehensive Scan Results:")
-    for result in results:
-        print(f"\nFile: {result['file_path']}")
-        print(f"Overall Risk: {result['overall_risk'].upper()}")
+            for future in concurrent.futures.as_completed(future_to_file):
+                result = future.result()
+                file_path = future_to_file[future]
 
-        if result.get('mime_type'):
-            print(f"  - MIME Type: {result['mime_type']}")
+                print(f"\nResults for: {result['file_path']}")
+                print(f"Risk Level: {result['risk_level'].upper()}")
+                print(f"File Type: {result['file_info']['file_type']}")
 
-        # Safely handle suspicious indicators
-        if result.get('suspicious_indicators'):
-            if result['suspicious_indicators'].get('extensions'):
-                print("  - Suspicious File Extensions Detected:")
-                for ext in result['suspicious_indicators']['extensions']:
-                    print(f"    * {ext}")
+                if result['suspicious_indicators']['characteristics']:
+                    print("Suspicious Characteristics:")
+                    for char in result['suspicious_indicators']['characteristics']:
+                        print(f"  - {char}")
 
-            if result['suspicious_indicators'].get('patterns'):
-                print("  - Suspicious Patterns Found:")
-                for pattern in result['suspicious_indicators']['patterns']:
-                    print(f"    * {pattern}")
+                if result['virustotal_status']:
+                    print("VirusTotal Results:")
+                    print(f"  - Detected: {result['virustotal_status']['detected']}")
+                    print(f"  - Malicious Engines: {result['virustotal_status']['malicious']}")
+                    print(f"  - Total Scans: {result['virustotal_status']['total_scans']}")
 
-        if result.get('virustotal_status'):
-            print(f"  - VirusTotal Status: {result['virustotal_status']}")
+    except KeyboardInterrupt:
+        print("\nScan interrupted by user.")
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
 
 
 if __name__ == "__main__":
