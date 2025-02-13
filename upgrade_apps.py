@@ -1,10 +1,13 @@
 import subprocess
+import threading
+import multiprocessing
 
-def upgrade_apps():
+
+def upgrade_app(app_id):
+    """Upgrade a single app using winget."""
     try:
-        print("\n⬆️  Upgrading all applications...")
         result = subprocess.run(
-            ['winget', 'upgrade', '--all'],
+            ['winget', 'upgrade', '--id', app_id, '--silent'],  # Upgrade one app
             capture_output=True,
             text=True,
             encoding='utf-8',
@@ -12,10 +15,26 @@ def upgrade_apps():
             shell=True
         )
 
-        if result.returncode == 0:
-            print("✅ Upgrade process completed.")
-        else:
-            print("❌ Error during upgrade:")
-            print(result.stderr)
+        if result.returncode != 0:
+            print(f"Error upgrading {app_id}")
     except Exception as e:
-        print(f"An error occurred during upgrade: {e}")
+        print(f"An error occurred while upgrading {app_id}")
+
+
+def upgrade_apps(app_list):
+    """Upgrade apps one by one using multithreading."""
+    threads = []
+    max_threads = multiprocessing.cpu_count()
+    for app in app_list:
+        if len(threads) <= max_threads:
+            app_thread = threading.Thread(target=upgrade_app, args=(app['id'],))
+            threads.append(app_thread)
+            app_thread.start()
+
+        if len(threads) >= max_threads:
+            for t in threads:
+                t.join()
+            threads = []
+
+    for t in threads:
+        t.join()

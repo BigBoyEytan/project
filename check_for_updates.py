@@ -1,25 +1,8 @@
-import subprocess
 import re
-
-def run_winget_command(command):
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            shell=True
-        )
-        if result.returncode != 0:
-            print(f"Error running winget: {result.stderr}")
-            return ""
-        return result.stdout
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return ""
+from apps.list_installed_apps import run_winget_command
 
 def get_updatable_apps():
+    """Retrieve list of applications with available updates."""
     output = run_winget_command(['winget', 'upgrade'])
     if not output:
         return []
@@ -42,6 +25,7 @@ def get_updatable_apps():
     return updatable_apps
 
 def display_updatable_apps(updatable_apps):
+    """Display list of applications with available updates."""
     if not updatable_apps:
         print("\n🌟 No updatable applications found.")
         return

@@ -67,9 +67,7 @@ class SuspiciousContentEngine:
 
         return findings
 
-    @staticmethod
-    def _read_file_content(file_path):
-        """Safely read file content."""
+    def _read_file_content(self,file_path):
         try:
             with open(file_path, 'rb') as f:
                 return f.read()
