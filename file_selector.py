@@ -7,11 +7,6 @@ import pythoncom
 
 class FileSelector:
     def __init__(self, initial_dir=r"C:\Users\student"):
-        """
-        Initialize FileSelector with a starting directory
-        Args:
-            initial_dir (str): Starting directory path
-        """
         self.initial_dir = initial_dir
         self.selected_files = []
 
@@ -34,22 +29,14 @@ class FileSelector:
             pythoncom.CoUninitialize()
 
     def select_files(self, show_dialog=True):
-        """
-        Open file selection dialog and add selected files to the list
-        Args:
-            show_dialog (bool): Whether to show the continue dialog after selection
-        Returns:
-            list: Currently selected files
-        """
-        buffer_size = 4096
+        buffer_size = 8192  # Increased for Unicode
         buffer = "\0" * buffer_size
 
+        # Use Unicode strings for filter
         file_filter = "All Files (*.*)\0*.*\0" \
-                      "Shortcuts (*.lnk)\0*.lnk\0" \
                       "Text Files (*.txt)\0*.txt\0" \
                       "Word Files (*.docx)\0*.docx\0" \
-                      "PDF Files (*.pdf)\0*.pdf\0" \
-                      "Image Files (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0\0"
+                      "PDF Files (*.pdf)\0*.pdf\0\0"
 
         flags = win32con.OFN_EXPLORER | win32con.OFN_FILEMUSTEXIST | win32con.OFN_ALLOWMULTISELECT
 
